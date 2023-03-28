@@ -534,7 +534,7 @@ class BertLayer(nn.Module):
             cross_attn_present_key_value = cross_attention_outputs[-1]
             present_key_value = present_key_value + cross_attn_present_key_value
 
-        layer_output = apply_chunking_to_forward(
+        layer_output,non_zeros = apply_chunking_to_forward(
             self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
         )
         outputs = (layer_output,) + outputs
@@ -543,12 +543,18 @@ class BertLayer(nn.Module):
         if self.is_decoder:
             outputs = outputs + (present_key_value,)
 
-        return outputs
+        return outputs,non_zeros
 
     def feed_forward_chunk(self, attention_output):
         intermediate_output = self.intermediate(attention_output)
+        # non_zero = torch.count_nonzero(intermediate_output,dim=[1,2])/(intermediate_output.shape[1]*intermediate_output.shape[2])
+        non_zero = torch.count_nonzero(intermediate_output,dim=[0,1,2])/(intermediate_output.shape[0]*intermediate_output.shape[1]*intermediate_output.shape[2])
+        # non_zero = torch.count_nonzero(intermediate_output,dim=[0,1])/(intermediate_output.shape[0]*intermediate_output.shape[1])
+        
+        # non_zero = non_zero.reshape(intermediate_output.shape[2],1)
+        
         layer_output = self.output(intermediate_output, attention_output)
-        return layer_output
+        return layer_output,non_zero
 
 
 class BertEncoder(nn.Module):
@@ -557,6 +563,7 @@ class BertEncoder(nn.Module):
         self.config = config
         self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
+        self.non_zeros = torch.tensor([])
 
     def forward(
         self,
@@ -574,7 +581,7 @@ class BertEncoder(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
-
+        non_zeros= []
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
@@ -598,7 +605,7 @@ class BertEncoder(nn.Module):
 
                     return custom_forward
 
-                layer_outputs = torch.utils.checkpoint.checkpoint(
+                layer_outputs,non_zero = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer_module),
                     hidden_states,
                     attention_mask,
@@ -607,7 +614,7 @@ class BertEncoder(nn.Module):
                     encoder_attention_mask,
                 )
             else:
-                layer_outputs = layer_module(
+                layer_outputs,non_zero = layer_module(
                     hidden_states,
                     attention_mask,
                     layer_head_mask,
@@ -617,6 +624,7 @@ class BertEncoder(nn.Module):
                     output_attentions,
                 )
 
+            non_zeros.append(non_zero)
             hidden_states = layer_outputs[0]
             if use_cache:
                 next_decoder_cache += (layer_outputs[-1],)
@@ -628,6 +636,9 @@ class BertEncoder(nn.Module):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
+
+        # self.non_zeros = torch.cat(non_zeros,dim=1)
+        self.non_zeros = torch.tensor(non_zeros)
         if not return_dict:
             return tuple(
                 v
@@ -646,6 +657,7 @@ class BertEncoder(nn.Module):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
+            Non_zero = self.non_zeros
         )
 
 
@@ -1035,6 +1047,7 @@ class BertModel(BertPreTrainedModel):
         if not return_dict:
             return (sequence_output, pooled_output) + encoder_outputs[1:]
 
+        non_zeros = encoder_outputs.Non_zero
         return BaseModelOutputWithPoolingAndCrossAttentions(
             last_hidden_state=sequence_output,
             pooler_output=pooled_output,
@@ -1042,6 +1055,7 @@ class BertModel(BertPreTrainedModel):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
             cross_attentions=encoder_outputs.cross_attentions,
+            Non_zero= non_zeros
         )
 
 
@@ -1607,6 +1621,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            Non_zero = outputs.Non_zero,
         )
 
 

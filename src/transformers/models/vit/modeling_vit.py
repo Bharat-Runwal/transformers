@@ -25,12 +25,7 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from ...activations import ACT2FN
-from ...modeling_outputs import (
-    BaseModelOutput,
-    BaseModelOutputWithPooling,
-    ImageClassifierOutput,
-    MaskedImageModelingOutput,
-)
+from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, ImageClassifierOutput, MaskedLMOutput
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer
 from ...utils import (
@@ -170,7 +165,6 @@ class ViTPatchEmbeddings(nn.Module):
         if num_channels != self.num_channels:
             raise ValueError(
                 "Make sure that the channel dimension of the pixel values match with the one set in the configuration."
-                f" Expected {self.num_channels} but got {num_channels}."
             )
         if not interpolate_pos_encoding:
             if height != self.image_size[0] or width != self.image_size[1]:
@@ -304,9 +298,9 @@ class ViTIntermediate(nn.Module):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str):
-            self.intermediate_act_fn = ACT2FN[config.hidden_act]
+            self.intermediate_act_fn =nn.ReLU() #ACT2FN[config.hidden_act]
         else:
-            self.intermediate_act_fn = config.hidden_act
+            self.intermediate_act_fn = nn.ReLU() #config.hidden_act
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
@@ -363,13 +357,15 @@ class ViTLayer(nn.Module):
         # in ViT, layernorm is also applied after self-attention
         layer_output = self.layernorm_after(hidden_states)
         layer_output = self.intermediate(layer_output)
+        
+        non_zero = torch.count_nonzero(layer_output,dim=[0,1,2])/(layer_output.shape[0]*layer_output.shape[1]*layer_output.shape[2])
 
         # second residual connection is done here
         layer_output = self.output(layer_output, hidden_states)
 
         outputs = (layer_output,) + outputs
 
-        return outputs
+        return outputs,non_zero
 
 
 class ViTEncoder(nn.Module):
@@ -378,6 +374,7 @@ class ViTEncoder(nn.Module):
         self.config = config
         self.layer = nn.ModuleList([ViTLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
+        self.non_zeros = torch.tensor([])
 
     def forward(
         self,
@@ -389,7 +386,7 @@ class ViTEncoder(nn.Module):
     ) -> Union[tuple, BaseModelOutput]:
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
-
+        non_zeros= []
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -404,14 +401,18 @@ class ViTEncoder(nn.Module):
 
                     return custom_forward
 
-                layer_outputs = torch.utils.checkpoint.checkpoint(
+                layer_outputs,non_zero  = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer_module),
                     hidden_states,
                     layer_head_mask,
                 )
             else:
-                layer_outputs = layer_module(hidden_states, layer_head_mask, output_attentions)
+                layer_outputs,non_zero = layer_module(hidden_states, layer_head_mask, output_attentions)
 
+            # print(layer_outputs.shape)
+            # print(non_zero)
+            non_zeros.append(non_zero)
+           
             hidden_states = layer_outputs[0]
 
             if output_attentions:
@@ -420,12 +421,16 @@ class ViTEncoder(nn.Module):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
+
+        # self.non_zeros = torch.cat(non_zeros,dim=1)
+        self.non_zeros = torch.tensor(non_zeros)
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
         return BaseModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
+            Non_zero=self.non_zeros
         )
 
 
@@ -555,10 +560,6 @@ class ViTModel(ViTPreTrainedModel):
         interpolate_pos_encoding: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
-        r"""
-        bool_masked_pos (`torch.BoolTensor` of shape `(batch_size, num_patches)`, *optional*):
-            Boolean masked positions. Indicates which patches are masked (1) and which aren't (0).
-        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -599,11 +600,13 @@ class ViTModel(ViTPreTrainedModel):
             head_outputs = (sequence_output, pooled_output) if pooled_output is not None else (sequence_output,)
             return head_outputs + encoder_outputs[1:]
 
+        non_zeros = encoder_outputs.Non_zero
         return BaseModelOutputWithPooling(
             last_hidden_state=sequence_output,
             pooler_output=pooled_output,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
+            Non_zero= non_zeros
         )
 
 
@@ -653,7 +656,7 @@ class ViTForMaskedImageModeling(ViTPreTrainedModel):
         self.post_init()
 
     @add_start_docstrings_to_model_forward(VIT_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=MaskedImageModelingOutput, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(output_type=MaskedLMOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         pixel_values: Optional[torch.Tensor] = None,
@@ -663,7 +666,7 @@ class ViTForMaskedImageModeling(ViTPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[tuple, MaskedImageModelingOutput]:
+    ) -> Union[tuple, MaskedLMOutput]:
         r"""
         bool_masked_pos (`torch.BoolTensor` of shape `(batch_size, num_patches)`):
             Boolean masked positions. Indicates which patches are masked (1) and which aren't (0).
@@ -689,7 +692,7 @@ class ViTForMaskedImageModeling(ViTPreTrainedModel):
         >>> bool_masked_pos = torch.randint(low=0, high=2, size=(1, num_patches)).bool()
 
         >>> outputs = model(pixel_values, bool_masked_pos=bool_masked_pos)
-        >>> loss, reconstructed_pixel_values = outputs.loss, outputs.reconstruction
+        >>> loss, reconstructed_pixel_values = outputs.loss, outputs.logits
         >>> list(reconstructed_pixel_values.shape)
         [1, 3, 224, 224]
         ```"""
@@ -733,9 +736,9 @@ class ViTForMaskedImageModeling(ViTPreTrainedModel):
             output = (reconstructed_pixel_values,) + outputs[1:]
             return ((masked_im_loss,) + output) if masked_im_loss is not None else output
 
-        return MaskedImageModelingOutput(
+        return MaskedLMOutput(
             loss=masked_im_loss,
-            reconstruction=reconstructed_pixel_values,
+            logits=reconstructed_pixel_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
@@ -839,4 +842,5 @@ class ViTForImageClassification(ViTPreTrainedModel):
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            Non_zero = outputs.Non_zero,
         )
